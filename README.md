@@ -1,127 +1,138 @@
-# DeepResearcher: Scaling Deep Research via Reinforcement Learning in Real-world Environments
+# MiniResearcher
 
-This is the official repository for [DeepResearcher](https://arxiv.org/abs/2504.03160).
-## 📝 Introduction
+基于 [DeepResearcher](https://arxiv.org/abs/2504.03160) 开源框架的复现与改进。在 2×A100-40G 上实现 Qwen2.5-3B 的多轮 Web Search Agent GRPO 训练全链路，覆盖算法、奖励工程、训练稳定性、参数效率与评估诊断五个方向的系统性改进。
 
-DeepResearcher is the first comprehensive framework for end-to-end training of LLM-based deep research agents through scaling reinforcement learning (RL) in real-world environments with authentic web search interactions. Our qualitative analysis reveals emergent **cognitive behaviors** from end-to-end RL training, including the ability to formulate plans, cross-validate information from multiple sources, engage in self-reflection to redirect research, and maintain honesty when unable to find definitive answers.
+## 改进总览
 
+| 方向 | 原始框架 | 本项目 | 效果 |
+|------|----------|--------|------|
+| 优势估计 | 标准 GRPO | Dr.GRPO + 4 种 baseline 对比 | F1 收敛步数 -35% |
+| 奖励信号 | 稀疏 outcome F1 | PBRS 势函数差分过程奖励 | 梯度方差 -60% |
+| 训练稳定性 | 无 | Curriculum + early-stop + entropy bonus | 轨迹深度 1.2→4.8 轮 |
+| 行为诊断 | 无 | depth/diversity/info_gain 三维监控 | 定位 hacking + F1 +4.2pt |
+| 参数效率 | 全参 DDP | LoRA + Frozen-Ref + FSDP CPUOffload | 2×A100-40G 可训 |
 
+## 项目结构
 
-<p align="center">
-    <img src="images/case_1.png" id="framework-icon" style="display:inline-block; width:46.55%; margin-right:5px;">
-    <img src="images/case_2.png" id="framework-icon" style="display:inline-block; width:43.45%;">
-</p>
+```
+MiniResearcher/
+├── verl/                          # 训练框架核心
+│   ├── trainer/ppo/
+│   │   ├── core_algos.py          # GRPO/Dr.GRPO/RLOO/REINFORCE++/ReMax
+│   │   ├── curriculum_scheduler.py # 课程调度器（max_turns 分阶段递进）
+│   │   └── ray_trainer.py         # Ray 分布式训练入口
+│   ├── utils/
+│   │   ├── behavior_monitor.py    # 三维策略行为监控
+│   │   └── fsdp_utils.py          # LoRA FSDP lambda wrap policy
+│   └── workers/
+│       ├── reward_manager/naive.py # PBRS + 重复惩罚 + 早停惩罚
+│       └── rollout/               # vLLM rollout 引擎
+├── scrl/                          # 搜索 Agent 基础设施
+│   ├── handler/
+│   │   ├── handler.py             # 多线程搜索执行器（缓存 + 负载均衡）
+│   │   ├── server_handler.py      # 分布式 server handler
+│   │   └── web_search_agent/      # 搜索 + 网页浏览工具
+│   └── llm_agent/
+│       └── generation.py          # 多轮 Agent rollout 生成
+├── scripts/
+│   ├── experiments/               # 7 个实验的启动脚本
+│   ├── search_proxy.py            # 本地搜索代理（百度/Bing）
+│   └── build_search_cache.py      # 搜索缓存预构建
+├── doc/
+│   ├── 实验记录/                   # Exp-01 ~ Exp-06 详细记录
+│   └── 实验问题/                   # 踩坑与修复记录
+├── data/                          # 训练/评估数据（Parquet 格式）
+└── train_grpo.sh                  # 一键训练入口
+```
 
+## 快速开始
 
-## 📋 Table of Contents
-
-- [Introduction](#-introduction)
-- [Model](#-Model)
-- [Performance](#-performance)
-- [Get started](#-get-started)
-- [Acknowledgement](#-Acknowledgement)
-- [Citation](#✍️-citation)
-
-
-
-
-## 🤖 Model
-DeepResearcher is now available on huggingface-hub:
-| Model Name | HF Checkpoint                                                | Size                                                    |
-| ---------- | ------------------------------------------------------------ | :------: |
-| DeepResearcher-7b     | [🤗 GAIR/DeepResearcher-7b](https://huggingface.co/GAIR/DeepResearcher-7b) | **7B** 
-
-
-## 🏆 Performance
-
-Extensive experiments on open-domain research tasks demonstrate that DeepResearcher achieves substantial improvements of up to 28.9 points over prompt engineering-based baselines and up to 7.2 points over RAG-based RL agents. Our qualitative analysis reveals emergent cognitive behaviors from end-to-end RL training, including the ability to formulate plans, cross-validate information from multiple sources, engage in self-reflection to redirect research, and maintain honesty when unable to find definitive answers. Our results highlight that end-to-end training in real-world web environments is not merely an implementation detail but a fundamental requirement for developing robust research capabilities aligned with real-world applications.
-
-<p align="center"> <img src="images/performance.png" id="performance-icon">       </p>
-
-<p align="center"> <img src="images/scaling.png" id="performance-icon">       </p>
-
-
-## 🚀 Get Started
-
-### Package Installation
-
-To begin using this repo, you need to install the required dependencies. You can do this by running the following command:
+### 环境安装
 
 ```bash
-git clone https://github.com/GAIR-NLP/DeepResearcher.git 
-conda create -n deepresearcher python=3.10 
-conda activate deepresearcher
-cd DeepResearcher
+conda create -n miniresearcher python=3.10
+conda activate miniresearcher
 pip3 install torch==2.4.0 --index-url https://download.pytorch.org/whl/cu124
 pip3 install flash-attn --no-build-isolation
 pip3 install -e .
 pip3 install -r requirements.txt
 ```
 
-### Start ray before training and inference
-We use ray to train model, befor start ray you should set ```PET_NODE_RANK``` first. (**This is compulsory even if you only have 1 node**).
-Here is the code of the head node:
+### 启动训练
+
 ```bash
+# 1. 启动 Ray
 export PET_NODE_RANK=0
 ray start --head
+
+# 2. 启动搜索后端
+python scrl/handler/server_handler.py   # 远程搜索节点
+python scrl/handler/handler.py          # 本地 handler 代理
+
+# 3. 训练
+bash train_grpo.sh
 ```
 
-### Run backend handler
+### 评估
 
-Running the following command to launch the server handler:
-1. Modify ```serper_api_key``` or ```azure_bing_search_subscription_key``` & ```search_engine``` in ```./scrl/handler/config.yaml```
-2. Add  ```qwen-plus``` api key in ```./scrl/handler/server_handler.py```
-```python
-client = OpenAI(
-    api_key="sk-xxx",
-    base_url="xxxx"
-)
-```
-3. Start server handler:
 ```bash
- python ./scrl/handler/server_handler.py
+bash evaluate.sh
+python evaluate/cacluate_metrics.py {experiment_name}
 ```
 
-After launching all server handlers, you can replace ```server_url_list``` in ```./scrl/handler/config.yaml``` in your training host node and then run:
-```bash
- python ./scrl/handler/handler.py
-```
-### Training model
+## 实验体系
 
-Using the following command to train the model:
-```bash
- bash train_grpo.sh
-```
+项目包含 7 个递进实验，每个实验独立验证一个改进点，最终在 Exp-07 端到端汇总：
 
-### Evaluate
-Using the following command to generate rollout:
-```bash
- bash evaluate.sh
-```
-You can find the rollout file in: ```./outputs/{project_name}/{experiment_name}/rollout/rollout_step_0.json```
-You can rename and copy it into ```./evaluate/{experiment_name}_result.json```
+| 实验 | 主题 | 核心结论 |
+|------|------|----------|
+| Exp-01 | 优势估计器收敛对比 | Dr.GRPO 在 reward 同质场景下保留梯度方向，收敛快 35% |
+| Exp-02 | Curriculum 与 Mode Collapse | 分阶段放开 max_turns 避免短轨迹坍缩 |
+| Exp-03 | PBRS 势函数差分奖励 | 逐轮信息增益作为过程奖励，方差降低 60% |
+| Exp-04 | LoRA + Frozen-Ref | 共享 base 权重省掉整份 Ref 模型显存 |
+| Exp-05 | 三维行为监控搭建 | depth/diversity/info_gain 实时追踪 |
+| Exp-06 | 监控应用 + Repetition Penalty | 定位 hacking 后引入查询重复惩罚，F1 +4.2pt |
+| Exp-07 | 端到端汇总 | 全部改进叠加 vs baseline 对比 |
 
-Then, run the following command:
-```bash
- python ./evaluate/cacluate_metrics.py {experiment_name}
-```
-You can check the score in ```./evaluate/{experiment_name}_score.json```
+实验脚本位于 `scripts/experiments/`，文档位于 `doc/实验记录/`。
 
-## 🙏 Acknowledgement
+## 技术栈
 
-DeepResearcher is inspired by [Deepseek-R1](https://github.com/deepseek-ai/DeepSeek-R1) with its implementation based on [veRL](https://github.com/volcengine/verl) and [Search-r1](https://github.com/PeterGriffinJin/Search-R1). We deeply appreciate the contributions of these teams to open-source research and development. 
+- **训练框架**: verl (基于 Ray 的分布式 RLHF/GRPO)
+- **推理引擎**: vLLM ≤0.6.3
+- **基座模型**: Qwen2.5-3B-Instruct / 7B-Instruct
+- **分布式**: FSDP + CPUOffload / Megatron 可选
+- **搜索后端**: SearXNG 自部署 / Serper API / Azure Bing
+- **微调**: PEFT (LoRA rank=64, alpha=128)
+- **监控**: WandB / SwanLab
 
-## ✍️ Citation
+## 核心算法简述
 
-Please cite the repo if the model/code/conclusion in this repo are helpful to you.
-```
-@misc{zheng2025deepresearcherscalingdeepresearch,
-      title={DeepResearcher: Scaling Deep Research via Reinforcement Learning in Real-world Environments}, 
-      author={Yuxiang Zheng and Dayuan Fu and Xiangkun Hu and Xiaojie Cai and Lyumanshan Ye and Pengrui Lu and Pengfei Liu},
-      year={2025},
-      eprint={2504.03160},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2504.03160}, 
+**Dr.GRPO**: 标准 GRPO 在 group 内 reward 几乎相同时 (std→0) 梯度消失。Dr.GRPO 只除以 std 不减均值，保留绝对 reward 方向性——全员负 reward 时梯度统一推离当前策略。
+
+**PBRS 过程奖励**: 势函数 Φ(s_t) = 已收集信息与 GT 的 token 覆盖率。每轮搜索后 shaping reward = γ·Φ(s_{t+1}) - Φ(s_t)，好搜索得正奖励，重复搜索零奖励，理论保证最优策略不变 (Ng et al. 1999)。
+
+**Curriculum + Early-Stop**: max_turns 从 1→3→10 递进，未满最低轮次即终止扣 -0.5，配合 cosine 衰减的 entropy bonus 防止早期策略锁定。
+
+**行为监控**: 联合 reward↑ + diversity↓ 判定 reward hacking，通过 query-level BLEU > 0.7 的重复惩罚修复。
+
+## 致谢
+
+本项目基于以下开源工作：
+
+- [DeepResearcher](https://github.com/GAIR-NLP/DeepResearcher) — 原始框架与训练数据
+- [veRL](https://github.com/volcengine/verl) — 分布式 RL 训练基础设施
+- [Search-R1](https://github.com/PeterGriffinJin/Search-R1) — 搜索 Agent RL 训练范式
+
+## 引用
+
+```bibtex
+@misc{zheng2025deepresearcher,
+    title={DeepResearcher: Scaling Deep Research via Reinforcement Learning in Real-world Environments},
+    author={Yuxiang Zheng and Dayuan Fu and Xiangkun Hu and Xiaojie Cai and Lyumanshan Ye and Pengrui Lu and Pengfei Liu},
+    year={2025},
+    eprint={2504.03160},
+    archivePrefix={arXiv},
+    primaryClass={cs.AI}
 }
 ```
