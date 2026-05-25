@@ -149,7 +149,12 @@ class ActorRolloutRefWorker(Worker):
                                enable_gradient_checkpointing=False,
                                trust_remote_code=False,
                                use_liger=False,
-                               role='actor'):
+                               role='actor',
+                               use_lora=False,
+                               lora_rank=64,
+                               lora_alpha=16,
+                               lora_dropout=0.0,
+                               base_module=None):
         from verl.utils.model import print_model_size, update_model_config, get_generation_config
         from verl.utils.torch_dtypes import PrecisionType
         from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForVision2Seq
@@ -205,7 +210,11 @@ class ActorRolloutRefWorker(Worker):
             else:
                 actor_module_class = AutoModelForCausalLM
 
-            actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
+            # For ref model with shared base weights: use the provided base_module instead of loading
+            if base_module is not None:
+                actor_module = base_module
+            else:
+                actor_module = actor_module_class.from_pretrained(pretrained_model_name_or_path=local_path,
                                                               torch_dtype=torch_dtype,
                                                               config=actor_model_config,
                                                               attn_implementation='flash_attention_2',
@@ -217,6 +226,26 @@ class ActorRolloutRefWorker(Worker):
 
             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
             actor_module.to(torch_dtype)
+
+            # ---- Actor-LoRA: Inject LoRA adapters into the actor model ----
+            # Key memory saving: only LoRA params (0.3% of total) are trainable and get sharded by FSDP.
+            # Base model params are frozen and can be kept on CPU or sharded without gradient/optimizer overhead.
+            # With is_lora=True in get_fsdp_wrap_policy, FSDP only wraps LoRA modules (trainable leaf modules).
+            if use_lora and role == 'actor':
+                from peft import get_peft_model, LoraConfig
+                lora_config = LoraConfig(
+                    r=lora_rank,
+                    lora_alpha=lora_alpha,
+                    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+                    lora_dropout=lora_dropout,
+                    bias="none",
+                    task_type="CAUSAL_LM",
+                )
+                actor_module = get_peft_model(actor_module, lora_config)
+                if self.rank == 0:
+                    from peft import inject_adapter_in_model
+                    actor_module.print_trainable_parameters()
+                print(f"[LoRA] Injected LoRA adapters: rank={lora_rank}, alpha={lora_alpha}")
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
@@ -240,7 +269,9 @@ class ActorRolloutRefWorker(Worker):
 
         mixed_precision = MixedPrecision(param_dtype=param_dtype, reduce_dtype=reduce_dtype, buffer_dtype=buffer_dtype)
 
-        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None))
+        # is_lora=True ensures FSDP only wraps trainable LoRA modules, keeping base model params
+        # off the sharded gradient/optimizer state path — the key to fitting 68GB on 2×A100-40G.
+        auto_wrap_policy = get_fsdp_wrap_policy(module=actor_module, config=fsdp_config.get('wrap_policy', None), is_lora=use_lora)
 
         if self._is_rollout and self.config.rollout.name == 'hf':
             # TODO(zhangchi.usc1992, shengguangming) fix me. Current, auto_wrap_policy causes HFRollout to hang in Gemma
@@ -361,6 +392,10 @@ class ActorRolloutRefWorker(Worker):
             else:
                 optim_config = None
                 fsdp_config = OmegaConf.create()
+            use_lora = self.config.model.get('use_lora', False)
+            lora_rank = self.config.model.get('lora_rank', 64)
+            lora_alpha = self.config.model.get('lora_alpha', 16)
+            lora_dropout = self.config.model.get('lora_dropout', 0.0)
             self.actor_module_fsdp, self.actor_optimizer, self.actor_lr_scheduler, self.actor_model_config = self._build_model_optimizer(
                 model_path=self.config.model.path,
                 fsdp_config=fsdp_config,
@@ -370,10 +405,28 @@ class ActorRolloutRefWorker(Worker):
                 enable_gradient_checkpointing=self.config.model.get('enable_gradient_checkpointing', False),
                 trust_remote_code=self.config.model.get('trust_remote_code', False),
                 use_liger=self.config.model.get('use_liger', False),
+                use_lora=use_lora,
+                lora_rank=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                base_module=None,
                 role='actor')
 
             # get the original unwrapped module
             self.actor_module = self.actor_module_fsdp._fsdp_wrapped_module
+
+            # For Actor-LoRA + Frozen-Ref weight sharing (Bullet 3):
+            # Extract the base model WITHOUT LoRA adapters to share with the ref model.
+            # ref = base weights (frozen, no optimizer state), actor = base + LoRA adapters (trainable).
+            # This avoids loading base weights twice, saving ~2×base_model_mem on 2×A100-40G.
+            self.actor_base_module_for_ref = self.actor_module
+            if use_lora:
+                try:
+                    from peft import PeftModel
+                    if isinstance(self.actor_module, PeftModel):
+                        self.actor_base_module_for_ref = self.actor_module.base_model
+                except ImportError:
+                    pass  # peft not installed; base_module_for_ref stays as actor_module
 
             if self._is_offload_optimizer:
                 offload_fsdp_optimizer(optimizer=self.actor_optimizer)
@@ -391,6 +444,10 @@ class ActorRolloutRefWorker(Worker):
             self.rollout, self.rollout_sharding_manager = self._build_rollout()
 
         if self._is_ref:
+            # For Actor-LoRA + Frozen-Ref weight sharing: ref shares base weights with actor
+            # (no LoRA on ref; frozen on CPU to save GPU memory).
+            # When actor is on same process, pass actor's base module to avoid re-loading weights.
+            base_module = getattr(self, 'actor_base_module_for_ref', None)
             self.ref_module_fsdp = self._build_model_optimizer(model_path=self.config.model.path,
                                                                fsdp_config=self.config.ref.fsdp_config,
                                                                optim_config=None,
@@ -399,6 +456,8 @@ class ActorRolloutRefWorker(Worker):
                                                                trust_remote_code=self.config.model.get(
                                                                    'trust_remote_code', False),
                                                                use_liger=self.config.model.get('use_liger', False),
+                                                               use_lora=False,  # ref has no LoRA; just frozen base weights
+                                                               base_module=base_module,
                                                                role='ref')[0]
             OmegaConf.set_struct(self.config.ref, True)
             with open_dict(self.config.ref):

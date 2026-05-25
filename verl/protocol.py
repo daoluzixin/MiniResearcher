@@ -255,8 +255,12 @@ class DataProto:
             assert len(self.batch.batch_size) == 1, 'only support num_batch_dims=1'
 
         if self.non_tensor_batch is not None:
-            for key, val in self.non_tensor_batch.items():
-                assert isinstance(val, np.ndarray)
+            for key, val in list(self.non_tensor_batch.items()):
+                if not isinstance(val, np.ndarray):
+                    try:
+                        self.non_tensor_batch[key] = np.array(val, dtype=object)
+                    except Exception:
+                        self.non_tensor_batch[key] = np.array([val], dtype=object)
 
         if self.batch is not None and len(self.non_tensor_batch) != 0:
             # TODO: we can actually lift this restriction if needed
@@ -264,9 +268,12 @@ class DataProto:
 
             batch_size = self.batch.batch_size[0]
             for key, val in self.non_tensor_batch.items():
-                assert isinstance(
-                    val, np.ndarray
-                ) and val.dtype == object, 'data in the non_tensor_batch must be a numpy.array with dtype=object'
+                if not isinstance(val, np.ndarray):
+                    val = np.array(val, dtype=object)
+                    self.non_tensor_batch[key] = val
+                if val.dtype != object:
+                    val = val.astype(object)
+                    self.non_tensor_batch[key] = val
                 assert val.shape[
                     0] == batch_size, f'key {key} length {len(val)} is not equal to batch size {batch_size}'
 
@@ -505,7 +512,8 @@ class DataProto:
 
         non_tensor_batch_lst = [{} for _ in range(chunks)]
         for key, val in self.non_tensor_batch.items():
-            assert isinstance(val, np.ndarray)
+            if not isinstance(val, np.ndarray):
+                val = np.array(val, dtype=object)
             non_tensor_lst = np.array_split(val, chunks)
             assert len(non_tensor_lst) == chunks
             for i in range(chunks):

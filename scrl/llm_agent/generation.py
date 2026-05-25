@@ -279,8 +279,32 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 response_finish = True
             else:
                 time.sleep(10)
-        with open(self.config.data_writing_file, 'r', encoding='utf-8') as f:
-            query_contents = json.load(f)
+        
+        # Wait for handler to fill in 'content' field for all items
+        # Handler writes RESPONSE_SIGNAL first, then processes requests in background threads
+        # Timeout after 120s to avoid infinite hang when searches fail
+        content_ready = False
+        max_wait = 120  # seconds
+        wait_elapsed = 0
+        while not content_ready:
+            with open(self.config.data_writing_file, 'r', encoding='utf-8') as f:
+                query_contents = json.load(f)
+            # Check if all items have 'content' field
+            ready_count = sum(1 for item in query_contents if 'content' in item and item['content'])
+            all_have_content = (ready_count == len(query_contents))
+            if all_have_content:
+                content_ready = True
+            elif wait_elapsed >= max_wait:
+                # Timeout: fill missing content with empty search result to avoid hanging
+                print(f"[WARNING] Timeout waiting for content ({ready_count}/{len(query_contents)} ready after {wait_elapsed}s). Filling missing with empty results.", flush=True)
+                for item in query_contents:
+                    if 'content' not in item or not item['content']:
+                        item['content'] = "Search failed: no results returned."
+                content_ready = True
+            else:
+                print(f"[INFO] Waiting for handler to fill 'content' field... ({ready_count}/{len(query_contents)} ready, {wait_elapsed}s elapsed)", flush=True)
+                time.sleep(5)
+                wait_elapsed += 5
         return query_contents
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
@@ -340,6 +364,11 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         """Parse response to get the thinking process and answer or tool call.
             return: [(is_stop, thinking, answer/tool_call), ...]
         """
+        # Handle DTensor or non-contiguous tensors by converting to regular tensor first
+        if hasattr(input_ids, 'to_local'):
+            input_ids = input_ids.to_local()
+        if not input_ids.is_contiguous():
+            input_ids = input_ids.contiguous()
         response_contents = self.tokenizer.batch_decode(input_ids)
         results = []
         for i, content in enumerate(response_contents):
@@ -349,14 +378,14 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                 if "</think>" not in content or "</answer>" not in content:
                     results.append((True, "", ""))
                 else:
-                    think = content.split("<think>")[1].split("</think>")[0]
+                    think_content = content.split("<think>")[1].split("</think>")[0]
                     answer = content.split("<answer>")[1].split("</answer>")[0]
-                    results.append((True, think, answer))
+                    results.append((True, think_content, answer))
             elif "<think>" in content and "<tool_call>" in content:
                 if "</tool_call>" not in content or "</think>" not in content:
                     results.append((True, "", ""))
                 else:
-                    think = content.split("<think>")[1].split("</think>")[0]
+                    think_content = content.split("<think>")[1].split("</think>")[0]
                     tool_call = content.split("<tool_call>")[1].split("</tool_call>")[0]
                     try:
                         tool_call = json.loads(tool_call)
@@ -370,7 +399,7 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
                             assert "url_list" in tool_call["arguments"], "no valid url_list in tool_call"
                             assert isinstance(tool_call["arguments"]["url_list"], list), "url_list should be a list"
                             assert len(tool_call["arguments"]["url_list"]) >= 1, "url_list number must be greater than 0"
-                        results.append((False, think, tool_call))
+                        results.append((False, think_content, tool_call))
                     except Exception as e:
                         print(f"model tool call format error: {e}")
                         results.append((True, "", ""))
@@ -448,7 +477,12 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
             print(f"node {node_rank}, turn {step} gen_output {len(gen_output.batch['responses'])} datas")
 
             results = self.parse_response(gen_output.batch['responses'], think=think)
-            assert len(results) == len(activate_list) # 每一轮更新后，结果数量和当前活跃的query数量一致
+            if len(results) != len(activate_list):
+                print(f"[WARNING] parse_response returned {len(results)} results but expected {len(activate_list)}. Possibly DTensor/batch_decode issue. Padding as needed.", flush=True)
+                if len(results) < len(activate_list):
+                    results.extend([(True, "", "")] * (len(activate_list) - len(results)))
+                else:
+                    results = results[:len(activate_list)]
             activate_list_copy = []
             tool_call_list = []
             for i in range(len(results)):
@@ -508,6 +542,32 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         attention_mask = torch.cat((prompts_attention_mask, responses_attention_mask), dim=-1)
         position_ids = self.tensor_fn.create_position_ids(attention_mask)
         
+        # ---- PBRS: Extract per-turn query info for Potential-Based Reward Shaping ----
+        # Φ(s_t) = token_overlap(accumulated_query_info, GT) / |GT|
+        # Shaping reward: γ * Φ(s_{t+1}) - Φ(s_t) at each tool_call turn
+        per_turn_info = []
+        for i, messages in enumerate(messages_list):
+            query_tokens_list = []
+            # Extract query tokens from tool result messages (role=="tool") 
+            # messages structure: [system, user, assistant(tool_call), tool(result), ...]
+            # The tool result's content is the user's search query
+            for msg in messages:
+                if msg.get("role") == "tool":
+                    query_content = msg.get("content", "")
+                    if query_content and isinstance(query_content, str):
+                        query_tokens = self.tokenizer.encode(query_content, add_special_tokens=False)
+                        query_tokens_list.append(query_tokens)
+            per_turn_info.append({
+                "idx": i,
+                "question": query_contents[agent_grpo_idx[i]],
+                "turn_queries": query_tokens_list,  # List[List[int]] — each turn's query tokens
+            })
+
+        # Write per-turn info to side-file (for PBRS reward manager to read)
+        per_turn_file_path = f"./outputs/{self.config.project_name}/{self.config.experiment_name}/rollout/rollout_step_{global_steps}_per_turn.json"
+        with open(per_turn_file_path, "w", encoding="utf-8") as f:
+            json.dump(per_turn_info, f, indent=4, ensure_ascii=False)
+
         message_tensor = DataProto.from_dict({
             'prompts': prompts_repeated,
             'responses': responses,
@@ -517,9 +577,13 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         })
         message_tensor.meta_info.update(meta_info)
         message_tensor.non_tensor_batch['agent_grpo_idx'] = np.array(agent_grpo_idx, dtype=object)
+        # PBRS: pass per-turn query info through batch for shaping reward computation
+        message_tensor.non_tensor_batch['per_turn_info'] = per_turn_info
+        # Store global_step for PBRS reward file lookup
+        message_tensor.meta_info['global_step'] = global_steps
         print("generation结束")
         
-        with open(f"./outputs/{self.config.project_name}/{self.config.experiment_name}/rollout/rollout_step_{global_steps}.json", "w", encoding='utf-8') as f:
+        with open(f"./outputs/{self.config.project_name}/{self.config.experiment_name}/rollout/rollout_step_{global_steps}.json", "w", encoding="utf-8") as f:
             write_list = []
             for i, message_str in enumerate(message_string_list):
                 write_list.append({

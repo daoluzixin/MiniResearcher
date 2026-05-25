@@ -102,7 +102,11 @@ class Handler:
                 future_to_content.append(future)
             # 等待所有任务完成
         for i, future in enumerate(future_to_content):
-            query_contents[i]["content"] = future.result()
+            try:
+                query_contents[i]["content"] = future.result(timeout=30)
+            except Exception as e:
+                print(f"[TIMEOUT] query {i} failed: {e}", flush=True)
+                query_contents[i]["content"] = []
         print(f"爬取/阅读网页用时{time.time()-start_time}")
         print("处理函数调用结束")
         return query_contents
@@ -180,8 +184,12 @@ class Handler:
                     future = handle_executor.submit(self.handle_single_query, query_content, self.api_result_dict)
                     future_to_content.append(future)
                 # 等待所有任务完成
-            for future in concurrent.futures.as_completed(future_to_content):
-                future.result()
+            for i, future in enumerate(future_to_content):
+                try:
+                    query_contents[i]["content"] = future.result(timeout=30)
+                except Exception as e:
+                    print(f"[TIMEOUT] query {i} failed: {e}", flush=True)
+                    query_contents[i]["content"] = []
             print(f"爬取/阅读网页用时{time.time()-start_time}")
 
             with open(self.handler_config.data_writing_file, 'w', encoding="utf-8") as f:

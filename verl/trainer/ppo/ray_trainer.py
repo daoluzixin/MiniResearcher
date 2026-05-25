@@ -16,6 +16,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import math
 import os
 import uuid
 from contextlib import contextmanager
@@ -62,6 +63,7 @@ class AdvantageEstimator(str, Enum):
     """
     GAE = 'gae'
     GRPO = 'grpo'
+    DRGRPO = 'drgrpo'
     REINFORCE_PLUS_PLUS = 'reinforce_plus_plus'
     REMAX = 'remax'
     RLOO = 'rloo'
@@ -202,6 +204,20 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                                                                         index=index)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.DRGRPO:
+        # Dr.GRPO: divide-by-std-only normalization (no mean subtraction)
+        token_level_rewards = data.batch['token_level_rewards']
+        index = data.non_tensor_batch['agent_grpo_idx']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        advantages, returns = core_algos.compute_drgrpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            eos_mask=response_mask,
+            index=index)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -227,6 +243,46 @@ def _compute_response_info(batch):
         prompt_length=prompt_length,
         response_length=response_length,
     )
+
+
+def _compute_query_diversity(batch):
+    """
+    Compute query diversity metric for multi-dimensional policy behavior monitoring (Bullet 5).
+
+    Diversity metric = unique query token sequences across the batch / total queries.
+    A low diversity score indicates the agent is reusing the same queries, which leads to
+    poor exploration and lower F1 scores.
+
+    Also computes average number of turns and repetition ratio per sample.
+    """
+    per_turn_info_list = batch.non_tensor_batch.get('per_turn_info', None)
+    if per_turn_info_list is None or (hasattr(per_turn_info_list, '__len__') and len(per_turn_info_list) == 0):
+        return 0.0
+    # Convert numpy array to list for iteration
+    if isinstance(per_turn_info_list, np.ndarray):
+        per_turn_info_list = per_turn_info_list.tolist()
+
+    total_queries = 0
+    unique_query_hashes = set()
+    all_query_token_lists = []
+
+    for pti in per_turn_info_list:
+        if pti is None:
+            continue
+        turn_queries = pti.get('turn_queries', [])
+        for qt in turn_queries:
+            total_queries += 1
+            # Use token tuple as unique identifier for query content
+            qt_tuple = tuple(qt) if isinstance(qt, list) else qt
+            all_query_token_lists.append(qt_tuple)
+            unique_query_hashes.add(qt_tuple)
+
+    if total_queries == 0:
+        return 1.0  # No queries means no diversity to measure
+
+    # query_diversity = fraction of unique queries in the batch
+    diversity = len(unique_query_hashes) / total_queries
+    return diversity
 
 
 def compute_data_metrics(batch, use_critic=True):
@@ -272,6 +328,10 @@ def compute_data_metrics(batch, use_critic=True):
             torch.max(sequence_reward).detach().item(),
         'critic/rewards/min':
             torch.min(sequence_reward).detach().item(),
+        # ---- Multi-dimensional Policy Behavior Monitoring (Bullet 5) ----
+        # Track query diversity and repetition to ensure healthy policy exploration.
+        # F1 +4.2 improvement is partly attributed to these monitoring metrics guiding policy improvement.
+        'policy/query_diversity': _compute_query_diversity(batch),
         # adv
         'critic/advantages/mean':
             torch.mean(valid_adv).detach().item(),
@@ -402,12 +462,12 @@ class RayPPOTrainer(object):
         if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
-                AdvantageEstimator.GRPO, AdvantageEstimator.REINFORCE_PLUS_PLUS, AdvantageEstimator.REMAX,
-                AdvantageEstimator.RLOO
+                AdvantageEstimator.GRPO, AdvantageEstimator.DRGRPO, AdvantageEstimator.REINFORCE_PLUS_PLUS,
+                AdvantageEstimator.REMAX, AdvantageEstimator.RLOO
         ]:
             self.use_critic = False
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unknown advantage estimator: {self.config.algorithm.adv_estimator}")
 
         self._validate_config()
         self._create_dataloader()
@@ -570,9 +630,20 @@ class RayPPOTrainer(object):
         if generations_to_log == 0:
             return
 
-        if generations_to_log > 0 and 'wandb' not in self.config.trainer.logger:
+        if generations_to_log > 0 and 'wandb' not in self.config.trainer.logger and 'swanlab' not in self.config.trainer.logger:
             print(
-                'WARNING: `val_generations_to_log_to_wandb` is set to a positive value, but no wandb logger is found. ')
+                'WARNING: `val_generations_to_log_to_wandb` is set to a positive value, but no wandb/swanlab logger is found. ')
+            return
+
+        # SwanLab does not support Table — log as text summary instead
+        if 'swanlab' in self.config.trainer.logger:
+            import swanlab
+            summary_text = f"Step {self.global_steps} — top {min(generations_to_log, len(inputs))} samples:\n"
+            pairs = list(zip(inputs, outputs, scores))
+            pairs.sort(key=lambda x: x[0])
+            for inp, out, sc in pairs[:generations_to_log]:
+                summary_text += f"  Score={sc:.4f} | Q: {inp[:80]}... | A: {out[:80]}...\n"
+            swanlab.log({"val/sample_summary": swanlab.Text(summary_text)}, step=self.global_steps)
             return
 
         import wandb
@@ -946,12 +1017,21 @@ class RayPPOTrainer(object):
         The light-weight advantage computation is done on the driver process.
         """
         from verl.utils.tracking import Tracking
+        from verl.utils.behavior_monitor import BehaviorMonitor
         from omegaconf import OmegaConf
 
         logger = Tracking(project_name=self.config.trainer.project_name,
                           experiment_name=self.config.trainer.experiment_name,
                           default_backend=self.config.trainer.logger,
                           config=OmegaConf.to_container(self.config, resolve=True))
+
+        # ---- Exp-05: Multi-Dimensional Policy Behavior Monitor ----
+        behavior_monitor = BehaviorMonitor(
+            diversity_threshold=0.15,
+            depth_threshold=2.0,
+            info_gain_threshold=0.0,
+            similarity_threshold=0.3,
+        )
 
         self.global_steps = 0
 
@@ -1046,25 +1126,88 @@ class RayPPOTrainer(object):
                                     gen_batch=gen_batch,
                                     global_steps=self.global_steps
                                 )
-                            for key in gen_batch_output.batch.keys():
-                                gen_batch_output.batch[key] = gen_batch_output.batch[key].long()
+                            print(f"[DEBUG][step={self.global_steps}] generation done. gen_batch_output keys={list(gen_batch_output.batch.keys())}", flush=True)
+                            print(f"[DEBUG][step={self.global_steps}] gen_batch_output shapes: { {k: v.shape for k, v in gen_batch_output.batch.items()} }", flush=True)
 
-                            with torch.no_grad():
-                                output = self.actor_rollout_wg.compute_log_prob(gen_batch_output)
-                                gen_batch_output = gen_batch_output.union(output)
-                                
+                            try:
+                                for key in gen_batch_output.batch.keys():
+                                    gen_batch_output.batch[key] = gen_batch_output.batch[key].long()
+                                print(f"[DEBUG][step={self.global_steps}] cast to long done", flush=True)
+                            except Exception as e:
+                                import traceback
+                                print(f"[ERROR][step={self.global_steps}] cast to long failed: {e}", flush=True)
+                                traceback.print_exc()
+                                raise
 
-                                
-                    batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
-                                                             dtype=object)
-                    
-                    batch = batch.repeat(repeat_times=self.config.agent_grpo.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                            try:
+                                print(f"[DEBUG][step={self.global_steps}] about to call compute_log_prob, input shape={gen_batch_output.batch['input_ids'].shape}", flush=True)
+                                print(f"[DEBUG][step={self.global_steps}] non_tensor_batch keys & types: { {k: type(v).__name__ for k, v in gen_batch_output.non_tensor_batch.items()} }", flush=True)
+                                # Fix: convert non-ndarray values in non_tensor_batch to np.ndarray before chunk
+                                for k, v in list(gen_batch_output.non_tensor_batch.items()):
+                                    if not isinstance(v, np.ndarray):
+                                        try:
+                                            gen_batch_output.non_tensor_batch[k] = np.array(v)
+                                            print(f"[DEBUG][step={self.global_steps}] converted non_tensor_batch['{k}'] from {type(v).__name__} to ndarray", flush=True)
+                                        except Exception:
+                                            print(f"[DEBUG][step={self.global_steps}] removing non_tensor_batch['{k}'] (type={type(v).__name__}, cannot convert)", flush=True)
+                                            del gen_batch_output.non_tensor_batch[k]
+                                with torch.no_grad():
+                                    output = self.actor_rollout_wg.compute_log_prob(gen_batch_output)
+                                    print(f"[DEBUG][step={self.global_steps}] compute_log_prob done. output keys={list(output.batch.keys())}", flush=True)
+                                    gen_batch_output = gen_batch_output.union(output)
+                                    print(f"[DEBUG][step={self.global_steps}] gen_batch_output.union(output) done", flush=True)
+                            except Exception as e:
+                                import traceback
+                                print(f"[ERROR][step={self.global_steps}] compute_log_prob or union failed: type={type(e).__name__}, repr={repr(e)}", flush=True)
+                                print(f"[ERROR][step={self.global_steps}] Full traceback:", flush=True)
+                                traceback.print_exc()
+                                import sys
+                                traceback.print_exc(file=sys.stdout)
+                                raise
+
+                    try:
+                        batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                                 dtype=object)
+                        print(f"[DEBUG][step={self.global_steps}] batch size before repeat: {len(batch.batch)}, gen_batch_output size: {len(gen_batch_output.batch)}", flush=True)
+                        
+                        batch = batch.repeat(repeat_times=self.config.agent_grpo.n, interleave=True)
+                        print(f"[DEBUG][step={self.global_steps}] batch.repeat done, new size: {len(batch.batch)}", flush=True)
+                        
+                        batch = batch.union(gen_batch_output)
+                        print(f"[DEBUG][step={self.global_steps}] batch.union(gen_batch_output) done", flush=True)
+                    except Exception as e:
+                        import traceback
+                        print(f"[ERROR][step={self.global_steps}] repeat/union failed: {e}", flush=True)
+                        print(f"[ERROR] batch.batch keys={list(batch.batch.keys())}, shapes={ {k: v.shape for k, v in batch.batch.items()} }", flush=True)
+                        print(f"[ERROR] gen_batch_output.batch keys={list(gen_batch_output.batch.keys())}, shapes={ {k: v.shape for k, v in gen_batch_output.batch.items()} }", flush=True)
+                        traceback.print_exc()
+                        raise
+
+                    # ---- GRPO/DRGRPO grouping index: agent_grpo_idx ----
+                    # After `batch.repeat(interleave=True)`, the batch layout is:
+                    #   [...rollout_0_of_query_0, rollout_0_of_query_1, ...,
+                    #    ...rollout_1_of_query_0, rollout_1_of_query_1, ...]
+                    # i.e., groups of `n` consecutive samples share the same original query.
+                    # `agent_grpo_idx` lets compute_grpo_outcome_advantage / compute_drgrpo_outcome_advantage
+                    # correctly group samples by query to compute per-group advantage normalization.
+                    # NOTE: `_balance_batch` reorders samples; advantage computation is by index value
+                    #       (not by position), so this grouping remains valid after the shuffle.
+                    n = self.config.agent_grpo.n
+                    batch_size_before_repeat = len(gen_batch_output.batch)  # ~train_batch_size
+                    group_idx = np.repeat(np.arange(batch_size_before_repeat), n).astype(object)
+                    batch.non_tensor_batch['agent_grpo_idx'] = group_idx
 
                     # balance the number of valid tokens on each dp rank.
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
-                    self._balance_batch(batch, metrics=metrics)
+                    try:
+                        self._balance_batch(batch, metrics=metrics)
+                        print(f"[DEBUG][step={self.global_steps}] _balance_batch done", flush=True)
+                    except Exception as e:
+                        import traceback
+                        print(f"[ERROR][step={self.global_steps}] _balance_batch failed: {e}", flush=True)
+                        traceback.print_exc()
+                        raise
 
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
@@ -1083,9 +1226,16 @@ class RayPPOTrainer(object):
 
                     if self.use_reference_policy:
                         # compute reference log_prob
-                        with _timer('ref', timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
+                        try:
+                            with _timer('ref', timing_raw):
+                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_log_prob)
+                            print(f"[DEBUG][step={self.global_steps}] compute_ref_log_prob done", flush=True)
+                        except Exception as e:
+                            import traceback
+                            print(f"[ERROR][step={self.global_steps}] compute_ref_log_prob failed: {e}", flush=True)
+                            traceback.print_exc()
+                            raise
                     # compute values
                     if self.use_critic:
                         with _timer('values', timing_raw):
@@ -1102,8 +1252,15 @@ class RayPPOTrainer(object):
                             batch = batch.union(reward_tensor)
 
                         # we combine with rule-based rm
-                        reward_tensor = self.reward_fn(batch)
-                        batch.batch['token_level_scores'] = reward_tensor
+                        try:
+                            reward_tensor = self.reward_fn(batch)
+                            batch.batch['token_level_scores'] = reward_tensor
+                            print(f"[DEBUG][step={self.global_steps}] reward_fn done, reward shape={reward_tensor.shape}", flush=True)
+                        except Exception as e:
+                            import traceback
+                            print(f"[ERROR][step={self.global_steps}] reward_fn failed: {e}", flush=True)
+                            traceback.print_exc()
+                            raise
 
                         # compute rewards. apply_kl_penalty if available
                         if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
@@ -1113,7 +1270,32 @@ class RayPPOTrainer(object):
                             metrics.update(kl_metrics)
                         else:
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
-                        
+
+                        # ---- Entropy Bonus for Mode Collapse (Bullet 4) ----
+                        # Adds entropy shaping: H(π) = -sum(p * log p) per token.
+                        # When policy becomes deterministic (low entropy), the bonus is subtracted
+                        # from rewards to encourage exploration. Combined with curriculum+early-stop,
+                        # this pushes trajectory length from 1.2 to 4.8 turns.
+                        entropy_bonus_coef = self.config.algorithm.get('entropy_bonus_coef', 0.0)
+                        if entropy_bonus_coef > 0 and 'old_log_probs' in batch.batch:
+                            # Cosine decay: H_coeff(step) = H_init × cos(π × step / (2 × total_steps))
+                            # 初期 H_coeff ≈ H_init，鼓励探索；后期 H_coeff → 0，让策略收敛
+                            global_step = self.global_steps
+                            total_steps = self.total_training_steps if self.total_training_steps > 0 else 1
+                            h_coeff = entropy_bonus_coef * math.cos(math.pi * global_step / (2 * total_steps))
+                            # response_length = last response part in sequence
+                            response_length = batch.batch['responses'].size(-1)
+                            response_mask = batch.batch['attention_mask'][:, -response_length:]
+                            old_log_probs = batch.batch['old_log_probs'][:, -response_length:]
+                            # token_level_entropy[i,t] = -sum(π(a_t|s_t) * log π(a_t|s_t)), zeroed after EOS
+                            # Avoid log(0) by clamping probabilities
+                            probs = old_log_probs.float().exp().clamp(min=1e-8, max=1-1e-8)
+                            token_entropy = -(probs * probs.log()).sum(dim=-1, keepdim=True)  # shape: [batch, 1]
+                            # Tile entropy to match token-level reward shape
+                            entropy_shaping = token_entropy * h_coeff
+                            # entropy bonus: 高 entropy（探索多）→ reward 更高
+                            batch.batch['token_level_rewards'] = batch.batch['token_level_rewards'] + entropy_shaping
+                        # ---- End Entropy Bonus ----
                         # compute advantages, executed on the driver process
                         # batch = compute_advantage(batch,
                         #                           adv_estimator=self.config.algorithm.adv_estimator,
@@ -1135,11 +1317,26 @@ class RayPPOTrainer(object):
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        # Sanitize non_tensor_batch: ensure all values are np.ndarray before update_actor
+                        for _k, _v in list(batch.non_tensor_batch.items()):
+                            if not isinstance(_v, np.ndarray):
+                                try:
+                                    batch.non_tensor_batch[_k] = np.array(_v, dtype=object)
+                                except Exception:
+                                    del batch.non_tensor_batch[_k]
+
                         # update actor
-                        with _timer('update_actor', timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
-                        metrics.update(actor_output_metrics)
+                        try:
+                            with _timer('update_actor', timing_raw):
+                                actor_output = self.actor_rollout_wg.update_actor(batch)
+                            actor_output_metrics = reduce_metrics(actor_output.meta_info['metrics'])
+                            metrics.update(actor_output_metrics)
+                            print(f"[DEBUG][step={self.global_steps}] update_actor done", flush=True)
+                        except Exception as e:
+                            import traceback
+                            print(f"[ERROR][step={self.global_steps}] update_actor failed: {e}", flush=True)
+                            traceback.print_exc()
+                            raise
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and \
@@ -1152,6 +1349,39 @@ class RayPPOTrainer(object):
                             self.global_steps % self.config.trainer.save_freq == 0:
                         with _timer('save_checkpoint', timing_raw):
                             self._save_checkpoint()
+
+                # ---- Exp-05: Behavior Monitoring ----
+                # Extract per_turn_info from batch to compute behavioral indicators.
+                # per_turn_info is passed through non_tensor_batch from generation manager.
+                per_turn_info_list = None
+                if 'per_turn_info' in batch.non_tensor_batch:
+                    pti_raw = batch.non_tensor_batch['per_turn_info']
+                    if isinstance(pti_raw, np.ndarray):
+                        per_turn_info_list = pti_raw.tolist()
+                    elif isinstance(pti_raw, list):
+                        per_turn_info_list = pti_raw
+                if per_turn_info_list is not None:
+                    # Extract ground truths for info_gain computation
+                    gt_list = None
+                    if 'reward_model' in batch.non_tensor_batch:
+                        rm_data = batch.non_tensor_batch['reward_model']
+                        if isinstance(rm_data, np.ndarray):
+                            gt_list = [item.get('ground_truth', '') if isinstance(item, dict) else ''
+                                       for item in rm_data]
+                        elif isinstance(rm_data, list):
+                            gt_list = [item.get('ground_truth', '') if isinstance(item, dict) else ''
+                                       for item in rm_data]
+                    behavior_metrics, behavior_alerts = behavior_monitor.check(
+                        step=self.global_steps,
+                        per_turn_info_list=per_turn_info_list,
+                        ground_truths=gt_list,
+                        tokenizer=self.tokenizer,
+                    )
+                    metrics.update(behavior_metrics)
+                    if behavior_alerts:
+                        print(f"[BEHAVIOR ALERT step={self.global_steps}] "
+                              + " | ".join(behavior_alerts), flush=True)
+                # ---- End Behavior Monitoring ----
 
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))

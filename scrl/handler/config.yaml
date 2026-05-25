@@ -1,5 +1,5 @@
 # Web Search Agent
-search_engine: "google" # "google", "bing", "duckduckgo"
+search_engine: "searxng" # "google", "bing", "duckduckgo", "baidu", "proxy", "searxng"
 search_top_k: 10
 search_region: "us"
 search_lang: "en"
@@ -10,6 +10,19 @@ reading_agent_model: "qwen-plus"
 
 azure_bing_search_subscription_key: "key here if you use azure bing"
 azure_bing_search_mkt: "zh-CN" # "en-US"
+
+baidu_qianfan_api_key: "key here if you use baidu qianfan"
+
+# Proxy search settings (for GPU servers without internet access)
+# Run scripts/search_proxy.py on a machine with internet, then SSH reverse tunnel:
+#   ssh -R 8080:localhost:8080 root@gpu-server
+search_proxy_url: "http://localhost:8080"
+search_proxy_max_retries: 3
+
+# SearXNG settings (local meta-search engine, no API key needed)
+# Runs on the GPU server itself, no SSH tunnel required
+searxng_url: "http://localhost:8890"
+searxng_max_retries: 3
 
 # DuckDuckGo settings (free search engine, rate-limited)
 duckduckgo_max_concurrent: 5   # max concurrent requests to DuckDuckGo

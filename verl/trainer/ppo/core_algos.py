@@ -156,6 +156,57 @@ def compute_grpo_outcome_advantage(token_level_rewards: torch.Tensor,
     return scores, scores
 
 
+# NOTE(sgm): Dr.GRPO (Doubly-normalized GRPO) — only divide by std, do NOT subtract mean.
+# Gradient-only normalization: use standard deviation only for normalization.
+# Reference: similar to "divide-by-std" baseline in GRPO literature.
+def compute_drgrpo_outcome_advantage(token_level_rewards: torch.Tensor,
+                                     eos_mask: torch.Tensor,
+                                     index: torch.Tensor,
+                                     epsilon: float = 1e-6):
+    """
+    Compute advantage for Dr.GRPO (Doubly-normalized GRPO).
+    Unlike GRPO which does (score - mean) / std, Dr.GRPO only divides by std.
+    This is a gradient-only normalization technique.
+    Args:
+        token_level_rewards: `(torch.Tensor)`
+            shape: (bs, response_length)
+        eos_mask: `(torch.Tensor)`
+            shape: (bs, response_length)
+        index: `(torch.Tensor)`
+            group assignment for each sample, shape: (bs,)
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs, response_length)
+        Returns: `(torch.Tensor)`
+            shape: (bs, response_length)
+    """
+    response_length = token_level_rewards.shape[-1]
+    
+    assert not token_level_rewards.isnan().any(), "token_level_rewards is nan in compute_drgrpo_outcome_advantage"
+    
+    scores = token_level_rewards.sum(dim=-1)
+    id2score = defaultdict(list)
+    id2std = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                id2std[idx] = torch.std(torch.tensor(id2score[idx]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            scores[i] = scores[i] / (id2std[index[i]] + epsilon)
+        scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
+    
+    return scores, scores
+
+
 def compute_rloo_outcome_advantage(token_level_rewards: torch.Tensor,
                                    eos_mask: torch.Tensor,
                                    index: torch.Tensor,

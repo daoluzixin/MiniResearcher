@@ -172,3 +172,13 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Private docs (resume, experiment records)
+doc/resume_bullets.md
+doc/resume_strategy.md
+doc/实验记录/Exp-07_端到端汇总实验.md
+
+# Logs and caches
+log/
+scrl/handler/cache/
+scripts/.searxng/

@@ -101,7 +101,20 @@ def main_task(config, compute_score=None):
         role_worker_mapping[Role.RewardModel] = ray.remote(RewardModelWorker)
         mapping[Role.RewardModel] = global_pool_id
 
-    reward_manager_name = config.reward_model.get("reward_manager", "naive")
+    reward_manager_name = config.reward_model.get("reward_model", "naive")
+    # PBRS config (Bullet 2)
+    use_pbrs = config.reward_model.get("use_pbrs", False)
+    pbrs_gamma = config.reward_model.get("pbrs_gamma", 0.5)
+    # Curriculum + Early-stop Penalty config (Bullet 4)
+    use_curriculum = config.reward_model.get("use_curriculum", False)
+    curriculum_start_turn = config.reward_model.get("curriculum_start_turn", 2)
+    curriculum_end_turn = config.reward_model.get("curriculum_end_turn", 5)
+    early_stop_penalty_coef = config.reward_model.get("early_stop_penalty_coef", 0.1)
+    curriculum_bonus_coef = config.reward_model.get("curriculum_bonus_coef", 0.1)
+    # Query-level Repetition Penalty config (Bullet 5)
+    use_query_monitoring = config.reward_model.get("use_query_monitoring", False)
+    query_repetition_penalty_coef = config.reward_model.get("query_repetition_penalty_coef", 0.05)
+
     if reward_manager_name == 'naive':
         from verl.workers.reward_manager import NaiveRewardManager
         reward_manager_cls = NaiveRewardManager
@@ -110,10 +123,25 @@ def main_task(config, compute_score=None):
         reward_manager_cls = PrimeRewardManager
     else:
         raise NotImplementedError
-    reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, compute_score=compute_score)
+    reward_fn = reward_manager_cls(
+        tokenizer=tokenizer, num_examine=0, compute_score=compute_score,
+        use_pbrs=use_pbrs, pbrs_gamma=pbrs_gamma,
+        use_curriculum=use_curriculum,
+        curriculum_start_turn=curriculum_start_turn,
+        curriculum_end_turn=curriculum_end_turn,
+        early_stop_penalty_coef=early_stop_penalty_coef,
+        curriculum_bonus_coef=curriculum_bonus_coef,
+        use_query_monitoring=use_query_monitoring,
+        query_repetition_penalty_coef=query_repetition_penalty_coef,
+    )
 
     # Note that we always use function-based RM for validation
-    val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, compute_score=compute_score)
+    val_reward_fn = reward_manager_cls(
+        tokenizer=tokenizer, num_examine=1, compute_score=compute_score,
+        use_pbrs=use_pbrs, pbrs_gamma=pbrs_gamma,
+        use_curriculum=False,  # no curriculum penalty during validation
+        use_query_monitoring=False,  # no monitoring penalty during validation
+    )
 
     resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
