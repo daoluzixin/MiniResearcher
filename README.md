@@ -1,30 +1,72 @@
 # MiniResearcher
 
-基于 [DeepResearcher](https://arxiv.org/abs/2504.03160) (EMNLP 2025) 开源框架的复现与系统性改进。在 2×A100-40G 上实现 Qwen2.5-3B 的多轮 Web Search Agent GRPO 训练全链路，覆盖算法、奖励工程、训练稳定性、参数效率与评估诊断五个方向的改进。
+基于 [DeepResearcher](https://arxiv.org/abs/2504.03160) (EMNLP 2025) 开源框架的复现与改进实验。在单卡 A100-80G 上以 Qwen2.5-3B + LoRA 实现多轮 Web Search Agent 的 GRPO 训练全链路，探索奖励工程（PBRS）、训练稳定性（Curriculum）、行为诊断等方向的改进方案。
+
+> **局限性说明**：本项目受限于 3B 模型容量和 ~100 步训练预算，多数实验为短程验证（proof-of-concept），未完成原始论文 7B + 数千步的完整训练规模。实验结果展示的是方法有效性的方向性验证，而非 SOTA 指标。
 
 ## 与原始论文的关系
 
-[DeepResearcher](https://github.com/GAIR-NLP/DeepResearcher) 由上海交大 GAIR 团队提出，是首个在真实网络环境中通过端到端 RL 训练深度研究 Agent 的完整框架，使用 Qwen2.5-7B 全参训练 + 纯终局 F1 稀疏奖励，证明了 RL 训练能涌现出多步搜索、交叉验证、自我反思等认知行为。
+[DeepResearcher](https://github.com/GAIR-NLP/DeepResearcher) 由上海交大 GAIR 团队提出，是首个在真实网络环境中通过端到端 RL 训练深度研究 Agent 的完整框架（Qwen2.5-7B 全参、纯终局 F1 稀疏奖励、数千步训练），证明了 RL 能涌现多步搜索、交叉验证、自我反思等认知行为。
 
-本项目在此基础上解决"怎么训得好、训得稳、训得小"的问题：
+本项目在此基础上探索"怎么训得稳、训得小"：
 
 | 维度 | 原始论文 | 本项目 |
 |------|----------|--------|
-| 模型规模 | 7B 全参 | **3B + LoRA**（2×A100-40G 可训） |
-| 奖励信号 | 纯终局 F1（稀疏） | **PBRS 过程奖励**（密集梯度信号） |
-| 训练稳定性 | 未讨论坍缩问题 | **Curriculum + entropy bonus** 解决 mode collapse |
-| 诊断体系 | 无 | **三维行为监控** 区分真学会 vs reward hacking |
-| 优势估计 | 标准 GRPO | **Dr.GRPO** + 4 种 baseline 对比 |
+| 模型规模 | 7B 全参 | **3B + LoRA rank=64**（单卡 A100-80G） |
+| 奖励信号 | 纯终局 F1（稀疏） | **PBRS 势函数差分过程奖励**（密集信号） |
+| 训练稳定性 | 未讨论 | **Curriculum + entropy bonus + NaN 防护** |
+| 诊断体系 | 无 | **search_depth / diversity / info_gain 监控** |
+| 优势估计 | 标准 GRPO | 实现 **Dr.GRPO** 并对比多种 baseline |
 
-## 改进总览
+## 实验结果（基于真实训练日志）
 
-| 方向 | 原始框架 | 本项目 | 效果 |
-|------|----------|--------|------|
-| 优势估计 | 标准 GRPO | Dr.GRPO + 4 种 baseline 对比 | F1 收敛步数 -35% |
-| 奖励信号 | 稀疏 outcome F1 | PBRS 势函数差分过程奖励 | 梯度方差 -60% |
-| 训练稳定性 | 无 | Curriculum + early-stop + entropy bonus | 轨迹深度 1.2→4.8 轮 |
-| 行为诊断 | 无 | depth/diversity/info_gain 三维监控 | 定位 hacking + F1 +4.2pt |
-| 参数效率 | 全参 DDP | LoRA + Frozen-Ref + FSDP CPUOffload | 2×A100-40G 可训 |
+### Exp-03：PBRS vs Baseline（核心实验）
+
+| 指标 | Baseline (03a, 78步崩溃) | PBRS (03b, 128步) |
+|------|--------------------------|-------------------|
+| score/mean | −0.486 → −0.786 (恶化) | −0.518 → −0.632 (波动) |
+| search_depth | 1.04 → 1.00 (退化) | 1.77 → 2.00 (维持) |
+| grad_norm | 5,500 ~ 11,500 (爆炸) | 0.019 ~ 0.035 (极稳定) |
+| 结局 | 序列溢出 AssertionError 崩溃 | 正常训练至 step 129 |
+
+**关键发现**：
+- PBRS + 数值稳定性修复（fp32 upcast、NaN skip、Adam eps=1e-4）将 grad_norm 从万级爆炸压制到 0.02~0.04
+- Baseline 在无过程奖励时 search_depth 退化到 1.0（模型学会跳过搜索），PBRS 维持在 2.0
+- 两组 score/mean 均未显著提升（受限于搜索后端质量和 3B 模型容量）
+
+### Exp-02：Curriculum 验证
+
+| 指标 | Baseline (02a, 59步) | Ours (02f, 8步后OOM) |
+|------|---------------------|---------------------|
+| search_depth | 无记录（模型不搜索） | 0.0 → **2.875** |
+| score/mean | −1.0 → −0.65 | −0.625 → −0.306 |
+| grad_norm | ~12 (局部稳定) | 10.2 → 2.2 (递减) |
+
+**关键发现**：entropy_coeff=0.01 + early_stop_penalty=−0.5 在 8 步内教会模型使用搜索工具（depth 从 0 到 2.9），但 step 9 因序列超长 OOM 崩溃。
+
+### Exp-01：Dr.GRPO 验证（失败）
+
+300 步训练中 score/mean 全程锁死 −1.000。原因：实验设置为纯文本问答（非 Agent 模式），模型坍缩到固定失败模式。Dr.GRPO 的理论优势在此设置下未能验证。
+
+### 硬件实际使用情况
+
+| 实验 | GPU | 配置 |
+|------|-----|------|
+| Exp-01 | AutoDL ~A100-80G | 全参, n=4 |
+| Exp-02a | 2×A800-40GB | 全参, n=2 |
+| Exp-02f | 1×A100-80G (峰值 62GB) | LoRA(64), n=4 |
+| Exp-03a/03b | 1×A100-80G | LoRA(64), n=2/4 |
+
+## 改进方向总览
+
+| 方向 | 方案 | 实验状态 |
+|------|------|----------|
+| 优势估计 | Dr.GRPO + 4 种 baseline 对比 | Exp-01: 代码实现完成，实验设置有误导致失败 |
+| 奖励工程 | PBRS 势函数差分（γ=0.9, token overlap 势函数） | Exp-03: ✅ 验证有效（grad_norm 稳定 + depth 维持） |
+| 训练稳定性 | Curriculum + early-stop + entropy bonus | Exp-02: ✅ 8步内学会工具调用 |
+| 数值稳定性 | fp32 upcast + NaN skip + clamp + Adam eps | Exp-03b: ✅ 解决 LoRA 3B 训练中的梯度爆炸 |
+| 行为诊断 | depth/diversity/info_gain 三维监控 | 代码实现完成，集成到训练循环 |
+| 参数效率 | LoRA + Frozen-Ref + FSDP CPUOffload | ✅ 单卡 A100-80G 成功训练 |
 
 ## 项目结构
 
@@ -96,53 +138,35 @@ bash evaluate.sh
 python evaluate/cacluate_metrics.py {experiment_name}
 ```
 
-## 实验体系
-
-项目包含 7 个递进实验，每个实验独立验证一个改进点，最终在 Exp-07 端到端汇总：
-
-| 实验 | 主题 | 核心结论 |
-|------|------|----------|
-| Exp-01 | 优势估计器收敛对比 | Dr.GRPO 在 reward 同质场景下保留梯度方向，收敛快 35% |
-| Exp-02 | Curriculum 与 Mode Collapse | 分阶段放开 max_turns 避免短轨迹坍缩 |
-| Exp-03 | PBRS 势函数差分奖励 | 逐轮信息增益作为过程奖励，方差降低 60% |
-| Exp-04 | LoRA + Frozen-Ref | 共享 base 权重省掉整份 Ref 模型显存 |
-| Exp-05 | 三维行为监控搭建 | depth/diversity/info_gain 实时追踪 |
-| Exp-06 | 监控应用 + Repetition Penalty | 定位 hacking 后引入查询重复惩罚，F1 +4.2pt |
-| Exp-07 | 端到端汇总 | 全部改进叠加 vs baseline 对比 |
-
-实验脚本位于 `scripts/experiments/`，文档位于 `doc/实验记录/`。
-
 ## 技术栈
 
 - **训练框架**: verl (基于 Ray 的分布式 RLHF/GRPO)
 - **推理引擎**: vLLM ≤0.6.3
-- **基座模型**: Qwen2.5-3B-Instruct / 7B-Instruct
-- **分布式**: FSDP + CPUOffload / Megatron 可选
-- **搜索后端**: SearXNG 自部署 / Serper API / Azure Bing
+- **基座模型**: Qwen2.5-3B-Instruct
+- **分布式**: FSDP + CPUOffload
+- **搜索后端**: SearXNG 自部署 / Serper API
 - **微调**: PEFT (LoRA rank=64, alpha=128)
-- **监控**: WandB / SwanLab
+- **监控**: SwanLab
 
 ## 核心算法简述
 
-**Dr.GRPO**: 标准 GRPO 在 group 内 reward 几乎相同时 (std→0) 梯度消失。Dr.GRPO 只除以 std 不减均值，保留绝对 reward 方向性——全员负 reward 时梯度统一推离当前策略。
+**PBRS 过程奖励**: 势函数 Φ(s_t) = 已收集信息与 GT 的 token 覆盖率。每轮搜索后 shaping reward = γ·Φ(s_{t+1}) - Φ(s_t)，好搜索得正奖励，重复搜索零奖励，理论保证最优策略不变 (Ng et al. 1999)。实测效果：grad_norm 从万级爆炸降至 0.02~0.04。
 
-**PBRS 过程奖励**: 势函数 Φ(s_t) = 已收集信息与 GT 的 token 覆盖率。每轮搜索后 shaping reward = γ·Φ(s_{t+1}) - Φ(s_t)，好搜索得正奖励，重复搜索零奖励，理论保证最优策略不变 (Ng et al. 1999)。
+**Curriculum + Early-Stop**: max_turns 递增 + 未满最低轮次终止扣 -0.5 + entropy bonus (coeff=0.01)。实测效果：8 步内 search_depth 从 0 提升到 2.9。
 
-**Curriculum + Early-Stop**: max_turns 从 1→3→10 递进，未满最低轮次即终止扣 -0.5，配合 cosine 衰减的 entropy bonus 防止早期策略锁定。
+**Dr.GRPO**: 标准 GRPO 在 group 内 reward 几乎相同时 (std→0) 梯度消失。Dr.GRPO 只除以 std 不减均值，保留绝对 reward 方向性。代码实现完成但实验验证未成功。
 
-**行为监控**: 联合 reward↑ + diversity↓ 判定 reward hacking，通过 query-level BLEU > 0.7 的重复惩罚修复。
+**数值稳定性**: 3B LoRA 训练中发现 advantage 出现 -1,000,000 极端值导致 grad_norm 爆炸。通过 fp32 upcast + torch.clamp(-1e4, 1e4) + nan_to_num + Adam eps=1e-4 组合修复。
 
-## 实验结果摘要（Exp-03 PBRS vs Baseline）
+## 踩坑记录
 
-| 指标 | Baseline (03a) | PBRS (03b) | 变化 |
-|------|---------------|------------|------|
-| score/mean (最终) | 0.35 | 0.38 | +8.6% |
-| search_depth | 1.25 (退化) | 1.92 (稳定) | +53.6% |
-| grad_norm | 波动大 | 平稳收敛 | 方差 -60% |
+项目过程中遇到并解决的主要问题（详见 `doc/实验问题/`）：
 
-关键发现：PBRS 最大价值不在最终 F1 提升，而在于**维持搜索深度不退化**——baseline 训练后期模型倾向于跳过搜索直接出答案（depth 从 2.0 退化到 1.25），PBRS 通过密集过程奖励让模型持续学习"搜索是有价值的"。
-
-完整对比分析见 `logs_from_server/compare_all.py`。
+- **LoRA 参数 NaN 溢出**：advantage 极端值 → grad 爆炸 → 参数 NaN。修复方案见上。
+- **序列超长 AssertionError**：多轮搜索返回内容过长突破 max_token_len，需动态调整或截断。
+- **PyTorch 2.6 checkpoint 加载失败**：`weights_only=True` 默认行为变更，需显式传 `weights_only=False`。
+- **GPU 残留进程 OOM**：训练崩溃后 vLLM worker 未释放显存，需手动 kill。
+- **搜索缓存质量问题**：SearXNG 空结果率高影响 reward 信号质量。
 
 ## 致谢
 
