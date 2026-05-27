@@ -104,9 +104,18 @@ def clip_by_value(x, tensor_min, tensor_max):
 
 
 def entropy_from_logits(logits: torch.Tensor):
-    """Calculate entropy from logits."""
+    """Calculate entropy from logits.
+    
+    Uses numerically stable computation that handles -inf logits correctly.
+    The issue: softmax(-inf)=0, but 0 * (-inf) = NaN in IEEE 754.
+    Fix: use nan_to_num to replace NaN with 0 in the pd*logits product.
+    """
     pd = torch.nn.functional.softmax(logits, dim=-1)
-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+    # When logits contain -inf (e.g., from bf16 overflow or vocabulary masking),
+    # softmax gives 0 for those positions, but 0 * (-inf) = NaN.
+    # These positions should contribute 0 to entropy (p*log(p) -> 0 as p -> 0).
+    pd_logits = torch.where(torch.isfinite(logits), pd * logits, torch.zeros_like(logits))
+    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd_logits, dim=-1)
     return entropy
 
 
@@ -459,7 +468,9 @@ def get_constant_schedule_with_warmup(
 ):
 
     def lr_lambda(current_step):
-        return min(1, float(current_step) / float(max(1, num_warmup_steps)))
+        if num_warmup_steps == 0:
+            return 1.0
+        return min(1.0, float(current_step) / float(max(1, num_warmup_steps)))
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 

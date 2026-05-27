@@ -1,6 +1,20 @@
 # MiniResearcher
 
-基于 [DeepResearcher](https://arxiv.org/abs/2504.03160) 开源框架的复现与改进。在 2×A100-40G 上实现 Qwen2.5-3B 的多轮 Web Search Agent GRPO 训练全链路，覆盖算法、奖励工程、训练稳定性、参数效率与评估诊断五个方向的系统性改进。
+基于 [DeepResearcher](https://arxiv.org/abs/2504.03160) (EMNLP 2025) 开源框架的复现与系统性改进。在 2×A100-40G 上实现 Qwen2.5-3B 的多轮 Web Search Agent GRPO 训练全链路，覆盖算法、奖励工程、训练稳定性、参数效率与评估诊断五个方向的改进。
+
+## 与原始论文的关系
+
+[DeepResearcher](https://github.com/GAIR-NLP/DeepResearcher) 由上海交大 GAIR 团队提出，是首个在真实网络环境中通过端到端 RL 训练深度研究 Agent 的完整框架，使用 Qwen2.5-7B 全参训练 + 纯终局 F1 稀疏奖励，证明了 RL 训练能涌现出多步搜索、交叉验证、自我反思等认知行为。
+
+本项目在此基础上解决"怎么训得好、训得稳、训得小"的问题：
+
+| 维度 | 原始论文 | 本项目 |
+|------|----------|--------|
+| 模型规模 | 7B 全参 | **3B + LoRA**（2×A100-40G 可训） |
+| 奖励信号 | 纯终局 F1（稀疏） | **PBRS 过程奖励**（密集梯度信号） |
+| 训练稳定性 | 未讨论坍缩问题 | **Curriculum + entropy bonus** 解决 mode collapse |
+| 诊断体系 | 无 | **三维行为监控** 区分真学会 vs reward hacking |
+| 优势估计 | 标准 GRPO | **Dr.GRPO** + 4 种 baseline 对比 |
 
 ## 改进总览
 
@@ -39,8 +53,10 @@ MiniResearcher/
 │   ├── search_proxy.py            # 本地搜索代理（百度/Bing）
 │   └── build_search_cache.py      # 搜索缓存预构建
 ├── doc/
-│   ├── 实验记录/                   # Exp-01 ~ Exp-06 详细记录
+│   ├── 实验记录/                   # Exp-01 ~ Exp-07 详细记录
 │   └── 实验问题/                   # 踩坑与修复记录
+├── logs/                          # 训练日志（含 exp03 baseline/PBRS 完整 log）
+├── logs_from_server/              # 服务器拉取的日志 + 对比分析脚本
 ├── data/                          # 训练/评估数据（Parquet 格式）
 └── train_grpo.sh                  # 一键训练入口
 ```
@@ -115,6 +131,18 @@ python evaluate/cacluate_metrics.py {experiment_name}
 **Curriculum + Early-Stop**: max_turns 从 1→3→10 递进，未满最低轮次即终止扣 -0.5，配合 cosine 衰减的 entropy bonus 防止早期策略锁定。
 
 **行为监控**: 联合 reward↑ + diversity↓ 判定 reward hacking，通过 query-level BLEU > 0.7 的重复惩罚修复。
+
+## 实验结果摘要（Exp-03 PBRS vs Baseline）
+
+| 指标 | Baseline (03a) | PBRS (03b) | 变化 |
+|------|---------------|------------|------|
+| score/mean (最终) | 0.35 | 0.38 | +8.6% |
+| search_depth | 1.25 (退化) | 1.92 (稳定) | +53.6% |
+| grad_norm | 波动大 | 平稳收敛 | 方差 -60% |
+
+关键发现：PBRS 最大价值不在最终 F1 提升，而在于**维持搜索深度不退化**——baseline 训练后期模型倾向于跳过搜索直接出答案（depth 从 2.0 退化到 1.25），PBRS 通过密集过程奖励让模型持续学习"搜索是有价值的"。
+
+完整对比分析见 `logs_from_server/compare_all.py`。
 
 ## 致谢
 

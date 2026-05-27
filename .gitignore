@@ -182,3 +182,35 @@ doc/实验记录/Exp-07_端到端汇总实验.md
 log/
 scrl/handler/cache/
 scripts/.searxng/
+scripts/search_proxy.log
+
+# Allow training logs in logs/ and logs_from_server/ (override *.log)
+!logs/**/*.log
+!logs_from_server/**/*.log
+
+# Large cache/data files (not needed for code understanding)
+scripts/server_cache_full.json
+scripts/search_partials/
+scripts/all_new_batches.json
+scripts/new_cache_batch_*.json
+scripts/exp3_batch_*.json
+scripts/exp3_key_fixes.json
+scripts/exp3_missing.json
+scripts/missing_queries.json
+data/experiments/pending_cache/
+data/experiments/exp03a_cache_queries.json
+data/experiments/exp03a_model_queries.json
+
+# Rendercv (separate project)
+rendercv/
+
+# Temporary fix scripts at root level
+check_cache_quality.py
+check_fuzzy.py
+fix_optimizer_nan.py
+fix_optimizer_nan_v2.py
+fix_optimizer_nan_v3.py
+fix_per_turn_info.py
+
+# IDE
+.idea/

@@ -204,17 +204,137 @@ PBRS 实现本身不增加额外显存占用（只是 reward 计算逻辑变化�
 
 ---
 
-### 7.1 结果对比表（实验后填写）
+### 7.1 Exp-3a 实际运行记录
 
-| 实验 | γ | 梯度方差降低幅度 | early_turn_reward 均值 | F1 reward（终态） |
-|------|---|----------------|---------------------|----------------|
-| 3a baseline | - | 0%（baseline） | ≈0 | |
-| 3b PBRS | 0.9 | | | |
-| 3c PBRS | 0.5 | | | |
-| 3d PBRS | 1.0 | | | |
+#### 7.1.1 运行概况
 
-### 7.2 结论
+- **日期**：2025-05-26
+- **服务器**：AutoDL 单卡 A100-80G（后期因端口变化切换实例）
+- **SSH**：`ssh -p 50141 root@connect.westd.seetacloud.com`（密码 `Fo/AL868s0DE`）
+- **框架**：verl 0.2.0.dev + Ray + vLLM，DrGRPO 算法
+- **搜索环境**：本地离线缓存 proxy（端口 8890），Jaccard fuzzy 匹配
 
-- **最佳 γ 值**：________（预期 0.9）
-- **梯度方差实际降低了多少**：________（预期约 60%）
-- **PBRS 是否帮助了前期轮次的策略更新**：________
+#### 7.1.2 实际训练配置
+
+```bash
+/root/miniconda3/bin/python verl/trainer/main_ppo.py \
+    actor_rollout_ref.model.path="/root/models/Qwen/Qwen2___5-3B-Instruct" \
+    actor_rollout_ref.model.use_lora=true \
+    actor_rollout_ref.model.lora_rank=64 \
+    actor_rollout_ref.model.lora_alpha=16 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
+    actor_rollout_ref.rollout.max_model_len=4096 \
+    data.train_files="/root/DeepResearcher/data/train.parquet" \
+    data.train_batch_size=12 \
+    data.max_response_length=8192 \
+    algorithm.adv_estimator=drgrpo \
+    algorithm.kl_ctrl.kl_coef=0.001 \
+    trainer.total_training_steps=100 \
+    trainer.save_freq=20 \
+    trainer.n_gpus_per_node=1 \
+    max_turns=3 \
+    agent_grpo.n=2 \
+    search_engine="rag" \
+    reward_model.use_pbrs=false \
+    trainer.resume_mode=auto
+```
+
+核心参数：batch=12, n=2, max_turns=3, total_steps=100, save_freq=20, 单卡。
+
+#### 7.1.3 训练过程时间线
+
+| 阶段 | Step 范围 | 说明 |
+|------|-----------|------|
+| Run 1-6 | 1-20 | 早期调试，修复各种启动问题 |
+| Run 7 前半 | 21-37 | 从 step 20 checkpoint 续训，缓存为 540 条高质量本地数据 |
+| 缓存热更新 | step 38 左右 | 另一个会话补充缓存到 13,589 条，重启 proxy |
+| Run 7 后半 | 38-73 | 继续训练，step 73 后崩溃 |
+
+总训练时间约 1.5 小时（step 21-73，每步约 60-80s）。
+
+#### 7.1.4 遇到的问题及解决
+
+**问题 1：GPU 残留进程导致 OOM**
+
+杀掉 trainer 后，`ray::WorkerDict` 仍占 14GB VRAM，新训练启动时 OOM。
+
+解决：`ray stop --force` + `kill` 残留 PID + 等待显存释放。
+
+**问题 2：PyTorch 2.6 checkpoint 加载失败**
+
+```
+UnpicklingError: Weights only load failed... numpy.core.multiarray.scalar
+```
+
+PyTorch 2.6 默认 `weights_only=True`，但 verl checkpoint 的 extra_state 包含 numpy 数组。
+
+解决：在 `verl/utils/checkpoint/fsdp_checkpoint_manager.py` 中三处 `torch.load` 添加 `weights_only=False`。
+
+**问题 3：搜索缓存质量极差**
+
+初始缓存 12,636 条（49MB），经分析 75% 是英文 query 对应中文无关搜索结果（垃圾数据）。模型产生 2296 个不同 query，精确命中率 0%，fuzzy 匹配（≥0.2）仅 28%。
+
+解决：上传本地高质量缓存（540 条 → 后补充至 2231 条），重启 proxy。但训练中大部分时间使用的是低质量缓存。
+
+**问题 4：序列超长导致 AssertionError 崩溃（Step 73）**
+
+```
+AssertionError: max_token_len must be greater than the sequence length. 
+Got max_token_len=8192 and max_seq_len=9753
+```
+
+多轮 rollout 拼接后某个样本达到 9753 token，超过 `ppo_max_token_len_per_gpu=8192`。
+
+解决方案（未执行，留待后续实验）：将 `ppo_max_token_len_per_gpu` 提升至 16384。
+
+#### 7.1.5 核心指标趋势（Step 21-73）
+
+| 指标 | 早期 (21-30) | 中期 (31-50) | 后期 (51-73) | 趋势判断 |
+|------|-------------|-------------|-------------|---------|
+| reward (mean) | -0.24 ~ -0.92 | -0.07 ~ -0.96 | -0.53 ~ -0.88 | 无改善，高方差震荡 |
+| entropy | 0.56 ~ 1.52 | 0.64 ~ 1.83 | 0.68 ~ 1.59 | 无坍缩，维持多样性 |
+| KL loss | 0.001 ~ 0.011 | 0.001 ~ 0.012 | 0.001 ~ 0.019 | 极小，策略未偏离 |
+| search_depth | 1.0 ~ 1.6 | 1.0 ~ 1.6 | 1.0 ~ 1.6 | 无上升，未学会深搜 |
+| info_gain | 0 ~ 0.06 | 0 ~ 0.03 | 0 ~ 0.06 | 接近零，搜索无效 |
+| grad_norm | 2608 ~ 18587 | 5025 ~ 23048 | 5436 ~ 18762 | 波动大，不稳定 |
+
+#### 7.1.6 分析与结论
+
+**核心发现**：纯 F1 reward 在低质量搜索环境下完全无法驱动学习。
+
+具体表现：
+
+1. **Reward 没有学习曲线**——前期偶有好 batch（-0.07），但中后期稳定卡在 -0.65 ~ -0.88，模型收敛到"稳定的差"。
+2. **Search depth 始终 1.0-1.6**——模型没学会多轮搜索，因为搜索不提供正向反馈（info_gain ≈ 0）。
+3. **无过拟合**——100 条数据跑 ~6 epoch 但 entropy 没坍缩、KL 极小，说明模型连"拟合"都做不到。
+4. **根本原因是环境而非算法**——2296 个 model query 在缓存中精确命中 0%，fuzzy 匹配返回大量无关内容，模型从搜索中获取不到有用信息。
+
+**作为 baseline 的价值**：
+
+- 证明了"纯 outcome reward + 噪声搜索环境 = 模型无法学习有效搜索策略"
+- 为 Exp-3b（PBRS）提供了对照基线
+- 明确了搜索缓存质量是实验成功的前置条件
+
+#### 7.1.7 留待改进
+
+1. 缓存已补充至 2231 条高质量数据（针对模型实际 query 搜索），后续实验使用
+2. `ppo_max_token_len_per_gpu` 需提升至 16384 避免超长序列崩溃
+3. 考虑扩展训练数据到 200 条以增加样本多样性
+
+---
+
+### 7.2 结果对比表
+
+| 实验 | γ | Reward 均值 | Search Depth | Info Gain | 状态 |
+|------|---|------------|-------------|-----------|------|
+| 3a baseline | - | -0.72 | 1.25 | ≈0 | 完成（73/100步） |
+| 3b PBRS | 0.9 | | | | 待运行 |
+| 3c PBRS | 0.5 | | | | 待运行 |
+| 3d PBRS | 1.0 | | | | 待运行 |
+
+### 7.3 结论
+
+- **最佳 γ 值**：________（待 3b/3c/3d 完成后对比）
+- **PBRS 是否改善了搜索行为**：________
+- **3a Baseline 结论**：纯 F1 reward 在噪声搜索环境下无法驱动多轮搜索学习，模型理性选择"少搜或不搜"，reward 无改善趋势

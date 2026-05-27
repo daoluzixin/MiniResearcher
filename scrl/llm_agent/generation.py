@@ -131,7 +131,7 @@ class LLMGenerationManager:
             pad_token_id=tokenizer.pad_token_id
         ))
         
-        if self.config.search_engine == "rag":
+        if self.config.search_engine in ("rag", "searxng"):
             self.tools = TOOLS_FOR_WIKI
             self.system_prompt =  f"""## Background information 
 * Today is {strftime("%Y-%m-%d", gmtime())}
@@ -282,29 +282,17 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         
         # Wait for handler to fill in 'content' field for all items
         # Handler writes RESPONSE_SIGNAL first, then processes requests in background threads
-        # Timeout after 120s to avoid infinite hang when searches fail
         content_ready = False
-        max_wait = 120  # seconds
-        wait_elapsed = 0
         while not content_ready:
             with open(self.config.data_writing_file, 'r', encoding='utf-8') as f:
                 query_contents = json.load(f)
             # Check if all items have 'content' field
-            ready_count = sum(1 for item in query_contents if 'content' in item and item['content'])
-            all_have_content = (ready_count == len(query_contents))
+            all_have_content = all('content' in item for item in query_contents)
             if all_have_content:
                 content_ready = True
-            elif wait_elapsed >= max_wait:
-                # Timeout: fill missing content with empty search result to avoid hanging
-                print(f"[WARNING] Timeout waiting for content ({ready_count}/{len(query_contents)} ready after {wait_elapsed}s). Filling missing with empty results.", flush=True)
-                for item in query_contents:
-                    if 'content' not in item or not item['content']:
-                        item['content'] = "Search failed: no results returned."
-                content_ready = True
             else:
-                print(f"[INFO] Waiting for handler to fill 'content' field... ({ready_count}/{len(query_contents)} ready, {wait_elapsed}s elapsed)", flush=True)
+                print(f"[INFO] Waiting for handler to fill 'content' field... ({sum(1 for item in query_contents if 'content' in item and item['content'])}/{len(query_contents)} ready)", flush=True)
                 time.sleep(5)
-                wait_elapsed += 5
         return query_contents
 
     def _generate_with_gpu_padding(self, active_batch: DataProto) -> DataProto:
@@ -454,6 +442,17 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
             attention_mask = rollings_active['attention_mask']
             rollings_active['position_ids'] = self.tensor_fn.create_position_ids(attention_mask)
             
+            # Truncate prompts that exceed max_model_len to avoid vLLM validation error
+            # max_model_len = 8192, max_tokens (response) = 4096, so max prompt = 4096
+            max_prompt_tokens = 4096
+            seq_len = rollings_active["input_ids"].shape[1]
+            if seq_len > max_prompt_tokens:
+                print(f"[WARNING] Prompt length {seq_len} exceeds {max_prompt_tokens}, truncating from left", flush=True)
+                rollings_active["input_ids"] = rollings_active["input_ids"][:, -max_prompt_tokens:]
+                rollings_active["attention_mask"] = rollings_active["attention_mask"][:, -max_prompt_tokens:]
+                # Recompute position_ids after truncation
+                rollings_active["position_ids"] = self.tensor_fn.create_position_ids(rollings_active["attention_mask"])
+            
             with open(f"./outputs/{self.config.project_name}/{self.config.experiment_name}/rollout/rollout_step_{global_steps}_round_{step}.json", "w", encoding='utf-8') as f:
                 step_write_list = []
                 for i, input_ids in enumerate(rollings_active['input_ids']):
@@ -548,15 +547,39 @@ Only output the final answer (in words, numbers or phrase) inside the <answer></
         per_turn_info = []
         for i, messages in enumerate(messages_list):
             query_tokens_list = []
-            # Extract query tokens from tool result messages (role=="tool") 
-            # messages structure: [system, user, assistant(tool_call), tool(result), ...]
-            # The tool result's content is the user's search query
+            # Extract info from tool-call turns in the message history.
+            # The assistant message contains tool_calls with search queries,
+            # and the subsequent tool message contains search results (content may be list/dict/str).
             for msg in messages:
-                if msg.get("role") == "tool":
-                    query_content = msg.get("content", "")
-                    if query_content and isinstance(query_content, str):
-                        query_tokens = self.tokenizer.encode(query_content, add_special_tokens=False)
-                        query_tokens_list.append(query_tokens)
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    # Extract search query text from assistant's tool_call for depth/diversity tracking
+                    for tc in msg.get("tool_calls", []):
+                        func = tc.get("function", tc) if isinstance(tc, dict) else tc
+                        args = func.get("arguments", {}) if isinstance(func, dict) else {}
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                args = {}
+                        query_list = args.get("query", [])
+                        if isinstance(query_list, list):
+                            query_str = " ".join(str(q) for q in query_list)
+                        else:
+                            query_str = str(query_list)
+                        if query_str.strip():
+                            query_tokens = self.tokenizer.encode(query_str, add_special_tokens=False)
+                            query_tokens_list.append(query_tokens)
+                elif msg.get("role") == "tool":
+                    # Fallback: if no assistant tool_call was captured above,
+                    # use tool result content (handles cases where content is list/dict/str)
+                    if not query_tokens_list:
+                        query_content = msg.get("content", "")
+                        if query_content:
+                            if not isinstance(query_content, str):
+                                query_content = json.dumps(query_content, ensure_ascii=False)
+                            if query_content.strip():
+                                query_tokens = self.tokenizer.encode(query_content, add_special_tokens=False)
+                                query_tokens_list.append(query_tokens)
             per_turn_info.append({
                 "idx": i,
                 "question": query_contents[agent_grpo_idx[i]],
