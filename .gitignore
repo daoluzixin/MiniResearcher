@@ -183,10 +183,20 @@ log/
 scrl/handler/cache/
 scripts/.searxng/
 scripts/search_proxy.log
+local/
+private/
+*.local.sh
+*.local.json
 
 # Allow training logs in logs/ and logs_from_server/ (override *.log)
 !logs/**/*.log
 !logs_from_server/**/*.log
+
+# Public repo keeps only curated representative logs
+logs/*
+!logs/selected/
+!logs/selected/**
+logs_from_server/
 
 # Large cache/data files (not needed for code understanding)
 scripts/server_cache_full.json

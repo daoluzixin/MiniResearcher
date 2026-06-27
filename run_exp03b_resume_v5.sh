@@ -1,54 +1,29 @@
 #!/bin/bash
 set -euo pipefail
 
-# Exp-03b PBRS v5 - Resume from step 20 (clean checkpoint)
-# All stability fixes + root cause NaN fixes:
-#   1. entropy_coeff=0.01 (10x stronger entropy regularization)
-#   2. advantage clipping: [-5, 5] (in core_algos.py)
-#   3. kl_loss_coef=0.005 (5x stronger KL penalty)
-#   4. lr_lambda fix (warmup=0 returns 1.0)
-#   5. fp32 upcast + clamp(-1e4, 1e4) + nan_to_num for logits (dp_actor.py)
-#   6. autocast(enabled=False) for entropy/log_prob computation
-#   7. entropy_from_logits: torch.where(isfinite) to handle -inf correctly
-#   8. NaN backward skip + grad NaN skip
-#   9. OOM mitigation: ppo_max_token_len_per_gpu=12288
-# Why from step 20: step 40 checkpoint has NaN in LoRA weights (corrupted).
-# Step 20 verified clean (0 NaN keys).
+# Exp-03b: PBRS resume run from the last clean checkpoint.
 
-export PATH="/root/miniconda3/bin:$PATH"
-export PYTHONPATH="/root/DeepResearcher:${PYTHONPATH:-}"
-export PET_NODE_RANK=0
-export PET_WORLD_SIZE=1
-export PET_RANK=0
-export RAY_memory_monitor_refresh_ms=0
+PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+MODEL_PATH="${MODEL_PATH:-/path/to/Qwen2.5-3B-Instruct}"
+LOG_DIR="${LOG_DIR:-${PROJECT_ROOT}/logs/selected/exp03b_pbrs}"
+CKPT_DIR="${CKPT_DIR:-${PROJECT_ROOT}/ckpts/verl_examples/exp03b_pbrs_n4_v2}"
+
+export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
+export PET_NODE_RANK="${PET_NODE_RANK:-0}"
+export PET_WORLD_SIZE="${PET_WORLD_SIZE:-1}"
+export PET_RANK="${PET_RANK:-0}"
+export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"
 export HYDRA_FULL_ERROR=1
-export HF_HOME="/root/.cache/modelscope/hub"
+export HF_HOME="${HF_HOME:-${HOME}/.cache/modelscope/hub}"
 export TORCHDYNAMO_DISABLE=1
-export LD_LIBRARY_PATH="/root/miniconda3/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 
-cd /root/DeepResearcher
-
-# Remove corrupted step 40 checkpoint so resume_mode=auto picks step 20
-rm -rf /root/DeepResearcher/ckpts/verl_examples/exp03b_pbrs_n4_v2/global_step_40
-
-LOG_DIR="/root/DeepResearcher/logs/exp03b_pbrs"
+cd "${PROJECT_ROOT}"
+mkdir -p "${LOG_DIR}"
+rm -rf "${CKPT_DIR}/global_step_40"
 LOG_FILE="${LOG_DIR}/trainer_resume_v5.log"
 
-mkdir -p "$LOG_DIR"
-
-echo "========================================" | tee "$LOG_FILE"
-echo "Starting Exp-03b PBRS RESUME v5 at $(date)" | tee -a "$LOG_FILE"
-echo "Resuming from step 20 (clean checkpoint), all NaN fixes:" | tee -a "$LOG_FILE"
-echo "  - fp32 upcast + clamp + nan_to_num for logits" | tee -a "$LOG_FILE"
-echo "  - autocast(enabled=False) for entropy/log_prob" | tee -a "$LOG_FILE"
-echo "  - entropy_from_logits: torch.where(isfinite) fix" | tee -a "$LOG_FILE"
-echo "  - NaN skip (backward + optimizer step)" | tee -a "$LOG_FILE"
-echo "  - entropy_coeff=0.01, kl_loss_coef=0.005" | tee -a "$LOG_FILE"
-echo "  - ppo_max_token_len_per_gpu=12288" | tee -a "$LOG_FILE"
-echo "========================================" | tee -a "$LOG_FILE"
-
 python verl/trainer/main_ppo.py \
-    actor_rollout_ref.model.path=/root/autodl-tmp/models/Qwen/Qwen2.5-3B-Instruct \
+    actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=true \
     actor_rollout_ref.model.use_lora=true \
     actor_rollout_ref.model.lora_rank=64 \
@@ -67,9 +42,9 @@ python verl/trainer/main_ppo.py \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.max_model_len=16384 \
     actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
-    critic.model.path=/root/autodl-tmp/models/Qwen/Qwen2.5-3B-Instruct \
+    critic.model.path="${MODEL_PATH}" \
     critic.ulysses_sequence_parallel_size=1 \
-    data.train_files=/root/DeepResearcher/data/train.parquet \
+    data.train_files="${PROJECT_ROOT}/data/train.parquet" \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
     data.train_batch_size=12 \
@@ -99,4 +74,4 @@ python verl/trainer/main_ppo.py \
     reward_model.pbrs_gamma=0.9 \
     reward_model.use_curriculum=false \
     reward_model.use_query_monitoring=false \
-    2>&1 | tee -a "$LOG_FILE"
+    2>&1 | tee -a "${LOG_FILE}"
